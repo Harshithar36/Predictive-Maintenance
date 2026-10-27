@@ -1,3 +1,4 @@
+
 name: Predictive Maintenance Pipeline
 
 on:
@@ -6,8 +7,10 @@ on:
       - main
   workflow_dispatch:
 
-jobs:
+permissions:
+  contents: read
 
+jobs:
   prepare-data:
     name: Prepare Train and Test Data
     runs-on: ubuntu-latest
@@ -26,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas scikit-learn
 
-      - name: Prepare data
+      - name: Prepare stratified data
         run: |
           mkdir -p artifacts
 
@@ -39,65 +42,268 @@ jobs:
 
           df = pd.read_csv(DATA_PATH)
 
-          print("Dataset shape:", df.shape)
-          print("Columns:", df.columns.tolist())
+          if TARGET not in df.columns:
+              raise ValueError(f"Target column '{TARGET}' not found")
+
+          if df.isnull().any().any():
+              raise ValueError("Dataset contains missing values")
+
+          if df.duplicated().any():
+              print("Warning: duplicate rows detected")
 
           X = df.drop(columns=[TARGET])
           y = df[TARGET]
 
           X_train, X_test, y_train, y_test = train_test_split(
-              X,
-              y,
+              X, y,
               test_size=0.20,
               random_state=42,
               stratify=y
           )
 
           train_df = X_train.copy()
-          train_df[TARGET] = y_train.values
+          train_df[TARGET] = y_train
 
           test_df = X_test.copy()
-          test_df[TARGET] = y_test.values
+          test_df[TARGET] = y_test
 
           train_df.to_csv("artifacts/train.csv", index=False)
           test_df.to_csv("artifacts/test.csv", index=False)
 
-          print("Train shape:", train_df.shape)
-          print("Test shape:", test_df.shape)
-          print("Train and test files created successfully.")
+          print("Dataset shape:", df.shape)
+          print("Training shape:", train_df.shape)
+          print("Testing shape:", test_df.shape)
+          print("Feature columns:", X.columns.tolist())
           PY
 
-      - name: Upload train and test workflow artifacts
+      - name: Upload train and test data
         uses: actions/upload-artifact@v4
         with:
           name: train-test-data
           path: artifacts/
-
+          if-no-files-found: error
 
   model-stage:
-    name: Load Train Test Artifact
+    name: Train, Tune and Evaluate Model
     runs-on: ubuntu-latest
     needs: prepare-data
 
     steps:
-      - name: Download train and test artifacts
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas scikit-learn joblib
+
+      - name: Download train and test data
         uses: actions/download-artifact@v4
         with:
           name: train-test-data
           path: artifacts/
 
-      - name: Verify workflow artifacts
+      - name: Verify downloaded data
         run: |
-          echo "Downloaded workflow artifacts:"
-          ls -lh artifacts/
-
-          echo ""
-          echo "Train file:"
           test -f artifacts/train.csv
-
-          echo ""
-          echo "Test file:"
           test -f artifacts/test.csv
+          echo "Train and test files verified."
 
-          echo ""
-          echo "Workflow artifact verification successful."
+      - name: Train, tune and evaluate
+        run: |
+          mkdir -p models artifacts
+
+          python - <<'PY'
+          import json
+          import joblib
+          import pandas as pd
+
+          from pathlib import Path
+          from sklearn.model_selection import GridSearchCV, StratifiedKFold
+          from sklearn.tree import DecisionTreeClassifier
+          from sklearn.ensemble import (
+              RandomForestClassifier,
+              AdaBoostClassifier,
+              GradientBoostingClassifier
+          )
+          from sklearn.metrics import (
+              accuracy_score, precision_score, recall_score,
+              f1_score, roc_auc_score, classification_report,
+              confusion_matrix
+          )
+
+          TARGET = "Engine Condition"
+
+          train_df = pd.read_csv("artifacts/train.csv")
+          test_df = pd.read_csv("artifacts/test.csv")
+
+          X_train = train_df.drop(columns=[TARGET])
+          y_train = train_df[TARGET]
+          X_test = test_df.drop(columns=[TARGET])
+          y_test = test_df[TARGET]
+
+          if list(X_train.columns) != list(X_test.columns):
+              raise ValueError("Train/test feature columns do not match")
+
+          models = {
+              "Decision Tree": DecisionTreeClassifier(random_state=42),
+              "Random Forest": RandomForestClassifier(
+                  random_state=42, n_jobs=-1
+              ),
+              "AdaBoost": AdaBoostClassifier(random_state=42),
+              "Gradient Boosting": GradientBoostingClassifier(
+                  random_state=42
+              )
+          }
+
+          def evaluate(model, name):
+              pred = model.predict(X_test)
+              result = {
+                  "Model": name,
+                  "Accuracy": accuracy_score(y_test, pred),
+                  "Precision_weighted": precision_score(
+                      y_test, pred, average="weighted", zero_division=0
+                  ),
+                  "Recall_weighted": recall_score(
+                      y_test, pred, average="weighted", zero_division=0
+                  ),
+                  "F1_weighted": f1_score(
+                      y_test, pred, average="weighted", zero_division=0
+                  )
+              }
+
+              if hasattr(model, "predict_proba") and len(model.classes_) == 2:
+                  probabilities = model.predict_proba(X_test)[:, 1]
+                  result["ROC_AUC"] = roc_auc_score(
+                      y_test, probabilities
+                  )
+
+              return result
+
+          # Baseline comparison
+          baseline_results = []
+
+          for name, model in models.items():
+              model.fit(X_train, y_train)
+              baseline_results.append(evaluate(model, name))
+
+          baseline_df = pd.DataFrame(baseline_results)
+          baseline_df.to_csv(
+              "artifacts/baseline_results.csv", index=False
+          )
+          print("Baseline comparison:")
+          print(baseline_df.to_string(index=False))
+
+          # Tune Gradient Boosting using stratified 5-fold CV.
+          # Eight combinations: 2 learning rates x 2 depths x 2 sizes.
+          param_grid = {
+              "learning_rate": [0.05, 0.1],
+              "max_depth": [2, 3],
+              "n_estimators": [100, 150]
+          }
+
+          cv_strategy = StratifiedKFold(
+              n_splits=5, shuffle=True, random_state=42
+          )
+
+          grid_search = GridSearchCV(
+              estimator=GradientBoostingClassifier(random_state=42),
+              param_grid=param_grid,
+              scoring="f1",
+              cv=cv_strategy,
+              n_jobs=-1,
+              return_train_score=True,
+              refit=True
+          )
+
+          grid_search.fit(X_train, y_train)
+          best_model = grid_search.best_estimator_
+
+          # Save every candidate's parameters and CV results.
+          cv_df = pd.DataFrame(grid_search.cv_results_)
+          cv_df.to_csv(
+              "artifacts/tuning_experiments.csv", index=False
+          )
+
+          with open("artifacts/best_parameters.json", "w") as f:
+              json.dump(
+                  {
+                      "best_params": grid_search.best_params_,
+                      "best_cv_f1": grid_search.best_score_
+                  },
+                  f, indent=2
+              )
+
+          joblib.dump(best_model, "models/best_model.pkl")
+
+          # Evaluate the selected model on the held-out test set.
+          predictions = best_model.predict(X_test)
+
+          test_metrics = {
+              "accuracy": float(accuracy_score(y_test, predictions)),
+              "precision_weighted": float(precision_score(
+                  y_test, predictions, average="weighted",
+                  zero_division=0
+              )),
+              "recall_weighted": float(recall_score(
+                  y_test, predictions, average="weighted",
+                  zero_division=0
+              )),
+              "f1_weighted": float(f1_score(
+                  y_test, predictions, average="weighted",
+                  zero_division=0
+              )),
+              "best_cv_f1": float(grid_search.best_score_),
+              "best_params": grid_search.best_params_
+          }
+
+          if len(best_model.classes_) == 2:
+              test_metrics["roc_auc"] = float(roc_auc_score(
+                  y_test, best_model.predict_proba(X_test)[:, 1]
+              ))
+
+          with open("artifacts/test_metrics.json", "w") as f:
+              json.dump(test_metrics, f, indent=2)
+
+          report = classification_report(
+              y_test, predictions, output_dict=True, zero_division=0
+          )
+          pd.DataFrame(report).transpose().to_csv(
+              "artifacts/classification_report.csv"
+          )
+
+          cm = confusion_matrix(y_test, predictions)
+          pd.DataFrame(cm).to_csv(
+              "artifacts/confusion_matrix.csv", index=False
+          )
+
+          print("\nBest parameters:", grid_search.best_params_)
+          print("Best CV F1:", round(grid_search.best_score_, 4))
+          print("\nTest metrics:")
+          print(json.dumps(test_metrics, indent=2))
+          print("\nClassification report:")
+          print(classification_report(
+              y_test, predictions, zero_division=0
+          ))
+          print("\nSaved model: models/best_model.pkl")
+          print("Saved tuning history: artifacts/tuning_experiments.csv")
+          PY
+
+      - name: Upload model and evaluation outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: predictive-maintenance-results
+          path: |
+            models/best_model.pkl
+            artifacts/baseline_results.csv
+            artifacts/tuning_experiments.csv
+            artifacts/best_parameters.json
+            artifacts/test_metrics.json
+            artifacts/classification_report.csv
+            artifacts/confusion_matrix.csv
+          if-no-files-found: error
