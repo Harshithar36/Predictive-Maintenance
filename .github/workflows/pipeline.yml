@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   prepare-data:
@@ -307,3 +307,15 @@ jobs:
             artifacts/classification_report.csv
             artifacts/confusion_matrix.csv
           if-no-files-found: error
+      - name: Commit updated model to main
+        if: success() && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add models/best_model.pkl
+          if git diff --cached --quiet; then
+            echo "No model changes to commit."
+          else
+            git commit -m "Update trained predictive maintenance model [skip ci]"
+            git push origin HEAD:main
+          fi
